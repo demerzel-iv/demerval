@@ -8,7 +8,7 @@ from tqdm import tqdm
 import task_utils
 from metric_utils import add_mv_scores, add_oc_scores
 from model_utils import MODEL_PATH, get_tokenizer_path
-from solver import MathSolver
+from solver import HintMathSolver, MathSolver
 
 TASK_CLASS_MAP = {
     'math500': 'Math500TaskGenerator',
@@ -37,17 +37,22 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='math500', choices=TASK_KWARGS_MAP.keys(), help='dataset name')
     parser.add_argument('--max-num-tokens', type=int, default=32768, help='max number of tokens to generate')
     parser.add_argument('--temperature', type=float, default=0.6, help='sampling temperature')
+
     parser.add_argument('--output-dir', type=str, default='outputs/eval_results', help='directory to save eval results')
     parser.add_argument('--tensor-parallel-size', type=int, default=1, help='tensor parallel size for the evaluated model')
     parser.add_argument('--batch-size', type=int, default=64, help='generation batch size per scheduled job')
+
     parser.add_argument('--skip-oc-score', action='store_true', help='skip OpenCompass verifier scoring')
+    parser.add_argument('--use-hint-solver', action='store_true', help='use HintMathSolver for hint-augmented solving')
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    model_name = args.model_name
+    base_model_name = args.model_name
+    model_name = f'{args.model_name}-hint' if args.use_hint_solver else args.model_name
     dataset_name = args.dataset
     max_num_tokens = args.max_num_tokens
     temperature = args.temperature
@@ -68,8 +73,8 @@ def main():
     print(f'task: {model_name}-{dataset_name}-{max_num_tokens // 1024}k, temperature={temperature}')
 
     llm_kwargs = {
-        'model': MODEL_PATH[model_name],
-        'tokenizer': get_tokenizer_path(model_name),
+        'model': MODEL_PATH[base_model_name],
+        'tokenizer': get_tokenizer_path(base_model_name),
         'tensor_parallel_size': args.tensor_parallel_size,
         'gpu_memory_utilization': 0.9,
         'max_model_len': max_num_tokens,
@@ -90,7 +95,8 @@ def main():
     tasks = list(task_generator)
     random.shuffle(tasks)
 
-    solver = MathSolver(
+    solver_class = HintMathSolver if args.use_hint_solver else MathSolver
+    solver = solver_class(
         sampling_params_kwargs=sampling_params_kwargs,
         llm_kwargs=llm_kwargs,
         num_device=8,

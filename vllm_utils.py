@@ -9,18 +9,12 @@ from queue import Empty
 from typing import List, Sequence, Tuple
 
 from vllm import LLM, SamplingParams
-# dummy
-#class LLM:
-#    def __init__(self, **kwargs):
-#        pass
-#    def chat(self, messages, sampling_params):
-#        return [int(msg[0]['content']) for msg in messages]
 
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("{asctime} {message}", datefmt="%H:%M:%S", style="{"))
+    handler.setFormatter(logging.Formatter("[{asctime}]{message}", datefmt="%H:%M:%S", style="{"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 logger.propagate = False
@@ -70,6 +64,7 @@ def _worker(
     device_ids: Sequence[int],
     llm_kwargs,
     sampling_params_kwargs,
+    enable_thinking,
     task_queue,
     result_queue,
 ):
@@ -88,6 +83,10 @@ def _worker(
     # Build SamplingParams inside each worker so the parent only needs to pass
     # simple kwargs through multiprocessing.
     sampling_params = SamplingParams(**sampling_params_kwargs)
+    tokenizer = None
+    if enable_thinking is not None:
+        tokenizer = llm.get_tokenizer()
+
     logger.info(f"[worker {worker_rank}] llm initialized")
 
     while True:
@@ -107,7 +106,24 @@ def _worker(
             # vLLM shows a tqdm progress bar by default; each worker logging its
             # own bar makes multi-process terminal output noisy, so keep progress
             # reporting in the main process only.
-            outputs = llm.chat(messages, sampling_params, use_tqdm=False)
+            if enable_thinking is None:
+                outputs = llm.chat(messages, sampling_params, use_tqdm=False)
+            else:
+                # Offline LLM.chat in this vLLM version does not expose
+                # enable_thinking, so apply the chat template here and pass
+                # tokenized prompts to generate.
+                prompts = []
+                for message in messages:
+                    prompt_text = tokenizer.apply_chat_template(
+                        message,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                    prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+                    prompts.append({"prompt_token_ids": prompt_token_ids})
+
+                outputs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
         except Exception as exc:
             # Report the traceback before re-raising so the main process can
             # fail fast instead of waiting forever on a missing batch result.
@@ -138,6 +154,7 @@ def parallel_generate(
     sampling_params_kwargs,
     num_device: int = 8,
     batch_size: int = 64,
+    enable_thinking=None,
 ):
     """Generate chat completions with dynamic batch scheduling across vLLM workers.
 
@@ -150,6 +167,12 @@ def parallel_generate(
         return []
 
     assert batch_size > 0
+    # Accept either one-message conversations or already grouped conversations.
+    # Workers always receive list[list[message]], matching vLLM's chat API.
+    messages_list = [
+        [message] if isinstance(message, dict) else message
+        for message in messages_list
+    ]
     sampling_params_kwargs = sampling_params_kwargs or {}
     tensor_parallel_size = llm_kargs["tensor_parallel_size"]
     device_groups = _device_groups(num_device, tensor_parallel_size)
@@ -173,6 +196,8 @@ def parallel_generate(
     result_queue = ctx.Queue()
     processes = []
 
+    # Queue all batches up front; each worker pulls the next available batch,
+    # which keeps faster GPU groups busy when generation lengths vary.
     for batch in batches:
         task_queue.put(batch)
     for _ in range(num_workers):
@@ -186,6 +211,7 @@ def parallel_generate(
                 device_ids,
                 llm_kargs,
                 sampling_params_kwargs,
+                enable_thinking,
                 task_queue,
                 result_queue,
             ),
@@ -227,6 +253,8 @@ def parallel_generate(
                         f"batch {batch_id}, expected {expected_len}"
                     )
                 end_idx = start_idx + len(outputs)
+                # Each worker returns a whole batch; place it back at the
+                # original slice so caller-visible ordering is deterministic.
                 results[start_idx:end_idx] = outputs
                 finished_batches += 1
                 total_output_tokens += _count_output_tokens(outputs)
@@ -261,7 +289,7 @@ def parallel_generate(
         logger.info("[main] cleaning up workers")
 
         for process in processes:
-            process.join(timeout=3)
+            process.join(timeout=10)
             logger.info(
                 f"[main] join phase-1: pid={process.pid}, "
                 f"alive={process.is_alive()}, exitcode={process.exitcode}"
@@ -292,29 +320,3 @@ def parallel_generate(
                 f"[main] join phase-3: pid={process.pid}, "
                 f"alive={process.is_alive()}, exitcode={process.exitcode}"
             )
-
-
-if __name__ == "__main__":
-    # Small smoke test for the queue-based scheduler. The dummy LLM returns the
-    # integer encoded in each message, so this checks that results are merged
-    # back in the original input order even when batches finish in any order.
-    mp.freeze_support()
-
-    total_messages = 17
-    messages = [
-        [{"role": "user", "content": str(idx)}]
-        for idx in range(total_messages)
-    ]
-
-    outputs = parallel_generate(
-        messages,
-        llm_kargs={"tensor_parallel_size": 2},
-        sampling_params_kwargs={},
-        num_device=8,
-        batch_size=3,
-    )
-
-    expected_outputs = list(range(total_messages))
-    logger.info(f"[test] outputs={outputs}")
-    assert outputs == expected_outputs, f"expected {expected_outputs}, got {outputs}"
-    logger.info("[test] passed")
