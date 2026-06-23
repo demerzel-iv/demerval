@@ -2,6 +2,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import traceback
 import multiprocessing as mp
 from queue import Empty
@@ -19,7 +20,7 @@ from vllm import LLM, SamplingParams
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("{message}", style="{"))
+    handler.setFormatter(logging.Formatter("{asctime} {message}", datefmt="%H:%M:%S", style="{"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 logger.propagate = False
@@ -50,6 +51,18 @@ def _device_groups(num_device: int, tensor_parallel_size: int) -> List[Tuple[int
         tuple(range(start, start + tensor_parallel_size))
         for start in range(0, num_device, tensor_parallel_size)
     ]
+
+
+def _count_output_tokens(outputs) -> int:
+    total_tokens = 0
+    for request_output in outputs:
+        if not hasattr(request_output, "outputs"):
+            continue
+        for completion_output in request_output.outputs:
+            token_ids = getattr(completion_output, "token_ids", None)
+            if token_ids is not None:
+                total_tokens += len(token_ids)
+    return total_tokens
 
 
 def _worker(
@@ -91,7 +104,10 @@ def _worker(
         )
 
         try:
-            outputs = llm.chat(messages, sampling_params)
+            # vLLM shows a tqdm progress bar by default; each worker logging its
+            # own bar makes multi-process terminal output noisy, so keep progress
+            # reporting in the main process only.
+            outputs = llm.chat(messages, sampling_params, use_tqdm=False)
         except Exception as exc:
             # Report the traceback before re-raising so the main process can
             # fail fast instead of waiting forever on a missing batch result.
@@ -184,11 +200,13 @@ def parallel_generate(
     results = [None] * len(messages_list)
     finished_batches = 0
     failed_error = None
+    total_output_tokens = 0
+    start_time = time.monotonic()
 
     try:
         while finished_batches < len(batches):
             try:
-                message = result_queue.get(timeout=10)
+                message = result_queue.get(timeout=60)
             except Empty:
                 logger.info("[main] waiting result timeout, checking worker status")
                 failed_workers = [
@@ -211,10 +229,14 @@ def parallel_generate(
                 end_idx = start_idx + len(outputs)
                 results[start_idx:end_idx] = outputs
                 finished_batches += 1
+                total_output_tokens += _count_output_tokens(outputs)
+                elapsed = max(time.monotonic() - start_time, 1e-9)
+                avg_output_tokens_per_second = total_output_tokens / elapsed
                 logger.info(
                     f"[main] received batch_id={batch_id} from worker={worker_rank}, "
                     f"range=[{start_idx}:{end_idx}), "
-                    f"finished={finished_batches}/{len(batches)}"
+                    f"finished={finished_batches}/{len(batches)}, "
+                    f"toks/s={avg_output_tokens_per_second:.2f}"
                 )
             elif message_type == "error":
                 _, worker_rank, batch_id, exc_repr, tb = message
