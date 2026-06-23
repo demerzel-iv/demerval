@@ -19,14 +19,11 @@ class MathSolver:
         self.num_device = num_device
         self.batch_size = batch_size
 
-    def build_message(self, task: Dict) -> List[Dict[str, str]]:
-        return [{
+    def solve(self, tasks: List[Dict]) -> List[Dict]:
+        messages = [{
             'role': 'user',
             'content': MATH_USER_PROMPT.format(problem=task['problem']),
-        }]
-
-    def solve(self, tasks: List[Dict]) -> List[Dict]:
-        messages = [self.build_message(task) for task in tasks]
+        } for task in tasks]
 
         task_outputs = parallel_generate(
             messages,
