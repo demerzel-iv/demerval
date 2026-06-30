@@ -104,7 +104,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Draw and summarize Demerval eval results.')
     parser.add_argument('--model-name', type=str, required=True, help='Comma-separated model names')
     parser.add_argument('--dataset-name', type=str, required=True, help='Comma-separated dataset names')
-    parser.add_argument('--output-txt', type=str, required=True, help='Path to save tab-separated summary')
+    parser.add_argument('--output-txt', type=str, required=True, help='Path to save aligned tab-separated summary')
     parser.add_argument('--max-num-tokens', type=int, default=32768, help='max number of tokens to generate')
     parser.add_argument('--temperature', type=float, default=0.6, help='sampling temperature')
     parser.add_argument('--draw', action='store_true', help='draw length distribution figures')
@@ -117,10 +117,15 @@ def main() -> None:
     dataset_names = parse_csv(args.dataset_name)
     max_length = int(args.max_num_tokens * 1.1)
 
-    lines = ['model\t' + '\t'.join(dataset_names)]
+    model_width = max(len('model'), max(len(model_name) for model_name in model_names))
+    value_width = 7
+    header = f'{"model":<{model_width}}\t' + '\t'.join(
+        f'{dataset_name[:value_width]:>{value_width}}' for dataset_name in dataset_names
+    )
+    lines = [header]
 
     for model_name in model_names:
-        row = [model_name]
+        row = [f'{model_name:<{model_width}}']
         for dataset_name in dataset_names:
             result_path = find_result_path(
                 model_name,
@@ -131,13 +136,13 @@ def main() -> None:
 
             if not os.path.exists(result_path):
                 print(f'Result file not found: {result_path}')
-                row.append('NA')
+                row.append(f'{"NA":>{value_width}}')
                 continue
 
             print(f'processing {result_path}')
             results = read_results(result_path)
             accuracy = calculate_accuracy(results)
-            row.append(f'{accuracy:.2f}')
+            row.append(f'{accuracy:.2f}'.rjust(value_width))
 
             if args.draw:
                 draw_result(results, result_path, max_length, accuracy)
