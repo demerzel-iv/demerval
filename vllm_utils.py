@@ -320,3 +320,7 @@ def parallel_generate(
                 f"[main] join phase-3: pid={process.pid}, "
                 f"alive={process.is_alive()}, exitcode={process.exitcode}"
             )
+
+        for queue in (task_queue, result_queue):
+            queue.cancel_join_thread()
+            queue.close()
