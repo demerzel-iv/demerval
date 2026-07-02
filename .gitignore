@@ -217,5 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+checkpoints
+checkpoints_config.json
 outputs
 AGENTS.md
